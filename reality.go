@@ -3,6 +3,7 @@
 package tls
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -12,6 +13,8 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -22,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"github.com/metacubex/utls/internal/ratelimit"
 	"github.com/metacubex/utls/mlkem"
 
@@ -104,6 +108,7 @@ type RealityConfig struct {
 
 	ServerNames  map[string]bool
 	PrivateKey   []byte
+	Mldsa65Seed  []byte
 	MinClientVer []byte
 	MaxClientVer []byte
 	MaxTimeDiff  time.Duration
@@ -123,9 +128,10 @@ func (a *RealityConfig) Clone() *RealityConfig {
 		Dest:                  a.Dest,
 		Xver:                  a.Xver,
 		ServerNames:           a.ServerNames,
-		PrivateKey:            a.PrivateKey,
-		MinClientVer:          a.MinClientVer,
-		MaxClientVer:          a.MaxClientVer,
+		PrivateKey:            bytes.Clone(a.PrivateKey),
+		Mldsa65Seed:           bytes.Clone(a.Mldsa65Seed),
+		MinClientVer:          bytes.Clone(a.MinClientVer),
+		MaxClientVer:          bytes.Clone(a.MaxClientVer),
 		MaxTimeDiff:           a.MaxTimeDiff,
 		ShortIds:              a.ShortIds,
 		LimitFallbackUpload:   a.LimitFallbackUpload,
@@ -241,18 +247,38 @@ func (hs *realityServerHandshakeStateTLS13) handshake() error {
 			}
 		}
 
-		var peerPub = peerData
+		expectedPeerLen := 32
+		if hs.hello.serverShare.group == X25519MLKEM768 {
+			expectedPeerLen = mlkem.EncapsulationKeySize768 + 32
+		}
+		if len(peerData) != expectedPeerLen {
+			return errors.New("REALITY: invalid client key share length")
+		}
+
+		peerPub := peerData
 		if hs.hello.serverShare.group == X25519MLKEM768 {
 			peerPub = peerData[mlkem.EncapsulationKeySize768:]
 		}
 
-		key, _ := generateECDHEKey(c.config.rand(), X25519)
+		key, err := generateECDHEKey(c.config.rand(), X25519)
+		if err != nil {
+			return err
+		}
 		copy(hs.hello.serverShare.data, key.PublicKey().Bytes())
-		peerKey, _ := key.Curve().NewPublicKey(peerPub)
-		hs.sharedKey, _ = key.ECDH(peerKey)
+		peerKey, err := key.Curve().NewPublicKey(peerPub)
+		if err != nil {
+			return err
+		}
+		hs.sharedKey, err = key.ECDH(peerKey)
+		if err != nil {
+			return err
+		}
 
 		if hs.hello.serverShare.group == X25519MLKEM768 {
-			k, _ := mlkem.NewEncapsulationKey768(peerData[:mlkem.EncapsulationKeySize768])
+			k, err := mlkem.NewEncapsulationKey768(peerData[:mlkem.EncapsulationKeySize768])
+			if err != nil {
+				return err
+			}
 			mlkemSharedSecret, ciphertext := k.Encapsulate()
 			hs.sharedKey = append(mlkemSharedSecret, hs.sharedKey...)
 			copy(hs.hello.serverShare.data, append(ciphertext, hs.hello.serverShare.data[:32]...))
@@ -269,12 +295,47 @@ func (hs *realityServerHandshakeStateTLS13) handshake() error {
 		}
 	*/
 	{
-		ed25519Priv, signedCert := realityServerCert()
-		signedCert = append([]byte{}, signedCert...)
-
+		ed25519Priv, baseCert := realityServerCert()
 		h := hmac.New(sha512.New, hs.AuthKey)
 		h.Write(ed25519Priv[32:])
-		h.Sum(signedCert[:len(signedCert)-64])
+		edSig := h.Sum(nil)
+
+		var signedCert []byte
+		if len(config.Mldsa65Seed) == mldsa65.SeedSize {
+			serverHelloBytes, err := hs.hello.marshal()
+			if err != nil {
+				return err
+			}
+			h.Write(hs.clientHello.original)
+			h.Write(serverHelloBytes)
+
+			var seed [mldsa65.SeedSize]byte
+			copy(seed[:], config.Mldsa65Seed)
+			_, mldsaPriv := mldsa65.NewKeyFromSeed(&seed)
+			var mldsaSig [mldsa65.SignatureSize]byte
+			if err := mldsa65.SignTo(mldsaPriv, h.Sum(nil), nil, false, mldsaSig[:]); err != nil {
+				return err
+			}
+			certificate := x509.Certificate{
+				SerialNumber: &big.Int{},
+				ExtraExtensions: []pkix.Extension{{
+					Id:    asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 3, 18},
+					Value: mldsaSig[:],
+				}},
+			}
+			signedCert, err = x509.CreateCertificate(c.config.rand(), &certificate, &certificate, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
+			if err != nil {
+				return err
+			}
+		} else if len(config.Mldsa65Seed) != 0 {
+			return fmt.Errorf("REALITY: invalid ML-DSA-65 seed length: %d", len(config.Mldsa65Seed))
+		} else {
+			signedCert = append([]byte{}, baseCert...)
+		}
+		if len(signedCert) < len(edSig) {
+			return errors.New("REALITY: unexpected certificate length")
+		}
+		copy(signedCert[len(signedCert)-len(edSig):], edSig)
 
 		hs.cert = &Certificate{
 			Certificate: [][]byte{signedCert},
@@ -343,6 +404,17 @@ func (c *Conn) realityWriteRecord(typ recordType, data []byte) (int, error) {
 // The configuration config must be non-nil and must include
 // at least one certificate or else set GetCertificate.
 func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if len(config.Mldsa65Seed) != 0 && len(config.Mldsa65Seed) != mldsa65.SeedSize {
+		conn.Close()
+		return nil, fmt.Errorf("REALITY: invalid ML-DSA-65 seed length: %d", len(config.Mldsa65Seed))
+	}
 	remoteAddr := conn.RemoteAddr().String()
 	if config.Log != nil {
 		config.Log("REALITY remoteAddr: %v", remoteAddr)
@@ -353,10 +425,20 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 		conn.Close()
 		return nil, errors.New("REALITY: failed to dial dest: " + err.Error())
 	}
+	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+		_ = conn.SetDeadline(deadline)
+		_ = target.SetDeadline(deadline)
+	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		_ = target.Close()
+	})
 
 	underlying := conn
 
 	mutex := new(sync.Mutex)
+	serverCfg := config.Config
+	serverCfg.SessionTicketsDisabled = true
 
 	hs := realityServerHandshakeStateTLS13{
 		serverHandshakeStateTLS13: serverHandshakeStateTLS13{
@@ -366,9 +448,9 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 					Conn:   conn,
 					Target: target,
 				},
-				config: &config.Config,
+				config: &serverCfg,
 			},
-			ctx: context.Background(),
+			ctx: ctx,
 		},
 		Config: config,
 	}
@@ -381,7 +463,7 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 	go func() {
 		for {
 			mutex.Lock()
-			hs.clientHello, _, err = hs.c.readClientHello(context.Background()) // TODO: Change some rules in this function.
+			hs.clientHello, _, err = hs.c.readClientHello(ctx) // TODO: Change some rules in this function.
 			if copying || err != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
 				break
 			}
@@ -575,14 +657,26 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 	}()
 
 	waitGroup.Wait()
+	stopped := stopCancel()
 	target.Close()
 	if config.Log != nil {
 		config.Log("REALITY remoteAddr: %v hs.c.isHandshakeComplete.Load(): %v", remoteAddr, hs.c.isHandshakeComplete.Load())
 	}
 	if hs.c.isHandshakeComplete.Load() {
+		if !stopped {
+			conn.Close()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, errors.New("REALITY: handshake canceled")
+		}
+		_ = conn.SetDeadline(time.Time{})
 		return hs.c, nil
 	}
 	conn.Close()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("REALITY: processed invalid connection: %w", err)
+	}
 	return nil, errors.New("REALITY: processed invalid connection") // TODO: Add details.
 
 	/*
