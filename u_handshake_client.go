@@ -478,16 +478,27 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 	// a compatibility measure (see RFC 8446, Section 4.1.2).
 	if c.config.SessionIDGenerator != nil {
 		hello.sessionId = make([]byte, 32)
-		hello.original = nil
-		data, err := hello.marshal()
-		if err != nil {
-			return err
+		const sessionIDOffset = 39
+		if len(hello.original) >= sessionIDOffset+32 && hello.original[sessionIDOffset-1] == 32 {
+			// Preserve uTLS-marshaled ClientHello wire bytes (GREASE, extension order, ALPS, etc.)
+			// while zeroing and patching only the 32-byte legacy_session_id field in place.
+			copy(hello.original[sessionIDOffset:sessionIDOffset+32], hello.sessionId)
+			if err := c.config.SessionIDGenerator(hello.original, hello.sessionId); err != nil {
+				return errors.New("tls: generate session id failed: " + err.Error())
+			}
+			copy(hello.original[sessionIDOffset:sessionIDOffset+32], hello.sessionId)
+		} else {
+			hello.original = nil
+			data, err := hello.marshal()
+			if err != nil {
+				return err
+			}
+			err = c.config.SessionIDGenerator(data, hello.sessionId)
+			if err != nil {
+				return errors.New("tls: generate session id failed: " + err.Error())
+			}
+			hello.original = nil
 		}
-		err = c.config.SessionIDGenerator(data, hello.sessionId)
-		if err != nil {
-			return errors.New("tls: generate session id failed: " + err.Error())
-		}
-		hello.original = nil
 	}
 	// [SHADOWTLS SECTION ENDS]
 
