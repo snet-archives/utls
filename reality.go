@@ -23,6 +23,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
@@ -32,6 +33,31 @@ import (
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
+
+// setRealityResetLinger forces a TCP RST instead of FIN when closing conn if
+// the underlying transport supports SO_LINGER.
+func setRealityResetLinger(conn net.Conn) {
+	for conn != nil {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetLinger(0)
+			return
+		}
+		if netConnProvider, ok := conn.(interface{ NetConn() net.Conn }); ok {
+			next := netConnProvider.NetConn()
+			if next != conn {
+				conn = next
+				continue
+			}
+		}
+		if upstreamProvider, ok := conn.(interface{ Upstream() any }); ok {
+			if next, ok := upstreamProvider.Upstream().(net.Conn); ok && next != conn {
+				conn = next
+				continue
+			}
+		}
+		return
+	}
+}
 
 type realityMirrorConn struct {
 	*sync.Mutex
@@ -543,6 +569,9 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 			n, err := target.Read(buf)
 			if n == 0 {
 				if err != nil {
+					if errors.Is(err, syscall.ECONNRESET) {
+						setRealityResetLinger(underlying)
+					}
 					conn.Close()
 					waitGroup.Done()
 					return
@@ -624,6 +653,9 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				}
 				if n, err := target.Read(buf); !hs.c.isHandshakeComplete.Load() {
 					if err != nil {
+						if errors.Is(err, syscall.ECONNRESET) {
+							setRealityResetLinger(underlying)
+						}
 						conn.Close()
 					}
 					if config.Log != nil {
@@ -651,7 +683,9 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				}()
 			}
 			conn.Write(s2cSaved)
-			io.Copy(underlying, newRateLimitedConn(target, &config.LimitFallbackDownload))
+			if _, copyErr := io.Copy(underlying, newRateLimitedConn(target, &config.LimitFallbackDownload)); errors.Is(copyErr, syscall.ECONNRESET) {
+				setRealityResetLinger(underlying)
+			}
 		}
 		waitGroup.Done()
 	}()
